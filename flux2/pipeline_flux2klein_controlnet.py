@@ -907,7 +907,7 @@ class Flux2KleinControlNetPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 controlnet_block_samples, controlnet_single_block_samples = self.controlnet(
                     hidden_states=latent_model_input,
                     controlnet_cond=control_latents,
-                    timestep=timestep,
+                    timestep=timestep / 1000,
                     conditioning_scale=conditioning_scale,
                     encoder_hidden_states=prompt_embeds,
                     img_ids=latent_image_ids,
