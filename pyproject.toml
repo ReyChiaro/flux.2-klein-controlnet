@@ -1,0 +1,19 @@
+[project]
+name = "mask-control"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.13.0",
+    #"diffusers==0.30.2",
+    "diffusers>=0.36.2",
+    "loguru>=0.7.3",
+    "prodigyopt>=1.1.2",
+    "protobuf>=7.34.1",
+    "sentencepiece>=0.2.1",
+    "torch==2.7.1",
+    "torchvision>=0.22.1",
+    #"transformers==4.42.0",
+    "transformers>=5.0.0",
+]
