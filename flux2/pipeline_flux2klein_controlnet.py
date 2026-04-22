@@ -564,13 +564,13 @@ class Flux2KleinControlNetPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             for m, c in zip(mask_images, control_images)
         ]
 
-        # List length B, (1, 32*4+1, H', W') each elem
+        # List length B, (1, 32*4+3, H', W') each elem
         control_images = [torch.cat([c, m], dim=1) for c, m in zip(control_images, mask_images)]
         control_latent_ids = self._prepare_image_ids(control_images)
 
-        # List length B, (H' * W', 32*4+1)
+        # List length B, (H' * W', 32*4+3)
         control_latents = torch.cat([self._pack_latents(c).squeeze(0) for c in control_images], dim=0)
-        control_latents = control_latents.unsqueeze(0)  # (1, N*1024, 128+1)
+        control_latents = control_latents.unsqueeze(0)  # (1, N*1024, 128+3)
 
         control_latents = control_latents.repeat(batch_size, 1, 1)
         control_latent_ids = control_latent_ids.repeat(batch_size, 1, 1)

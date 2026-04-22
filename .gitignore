@@ -17,3 +17,5 @@ outputs/
 flux1/
 
 main.py
+_[!_]*
+*.json

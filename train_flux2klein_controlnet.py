@@ -48,7 +48,7 @@ class ControlNetImageEditDataset(Dataset):
     - prompt_embeds: The encoded prompts by text encoder.
     """
 
-    def __init__(self, data_file: str, base_resolution: int, bucket_data: bool = False):
+    def __init__(self, data_file: str, base_resolution: int, bucket_data: bool = False, data_root: str | None = None):
         r"""
         Args:
             data_file: Path to the data mapping information, JSON format.
@@ -80,6 +80,7 @@ class ControlNetImageEditDataset(Dataset):
         with open(data_file, "r") as f:
             self.raw_data = json.load(f)
 
+        self.data_root = data_root
         self.bucket_data = bucket_data
         self.base_resolution = base_resolution
         self.items = []
@@ -91,6 +92,8 @@ class ControlNetImageEditDataset(Dataset):
             for bucket_id, content in self.raw_data.items():
                 # aspect_ratio is now [W_ratio, H_ratio] e.g., [16, 9]
                 ratio = content["aspect_ratio"]
+                if ratio is None:
+                    continue
                 target_size = self._calculate_target_size(ratio)
 
                 for entry in content["dataset"]:
@@ -101,6 +104,7 @@ class ControlNetImageEditDataset(Dataset):
         self.base_transform = T.Compose([T.ToTensor()])
 
     def construct_prompt(
+        self,
         prompt: str,
         placeholder: str | None = "[TARGET]",
         replaced_words: str | None = None,
@@ -115,7 +119,7 @@ class ControlNetImageEditDataset(Dataset):
         """
         rw, rh = ratio
         # Scale factor to maintain approximate pixel area of base_res * base_res
-        scale = (self.base_resolution**2 / (rw * rh)) ** 0.5
+        scale = (self.base_resolution / (rw * rh)) ** 0.5
         target_w = int(round(rw * scale / 64.0)) * 64
         target_h = int(round(rh * scale / 64.0)) * 64
         return (max(64, target_w), max(64, target_h))
@@ -156,9 +160,20 @@ class ControlNetImageEditDataset(Dataset):
         item = self.items[index]
 
         # Load images
-        source_img = Image.open(item["source_images"]).convert("RGB")
-        control_img = Image.open(item["control_images"]).convert("RGB")
-        target_img = Image.open(item["target_images"]).convert("RGB")
+        source_path = (
+            os.path.join(self.data_root, item["source_images"]) if self.data_root is not None else item["source_images"]
+        )
+        control_path = (
+            os.path.join(self.data_root, item["control_images"])
+            if self.data_root is not None
+            else item["control_images"]
+        )
+        target_path = (
+            os.path.join(self.data_root, item["target_images"]) if self.data_root is not None else item["target_images"]
+        )
+        source_img = Image.open(source_path).convert("RGB")
+        control_img = Image.open(control_path).convert("RGB")
+        target_img = Image.open(target_path).convert("RGB")
 
         if "target_size" in item:
             tw, th = item["target_size"]
@@ -182,49 +197,66 @@ class ControlNetImageEditDataset(Dataset):
             "source_images": source_img,
             "control_images": control_img,
             "target_images": target_img,
-            "prompts": item["prompts"],
+            "prompts": self.construct_prompt(item["prompts"], replaced_words="the masked object"),
         }
 
 
 class BucketBatchSampler(Sampler):
+    r"""
+    An accelerate compatible batch sampler, support DDP training.
+    Note that we should initialize accelerator with `dispatch_batches=False`.
+    """
 
-    def __init__(self, item_to_bucket: list[str], batch_size: int, drop_last: bool = False):
+    def __init__(
+        self,
+        item_to_bucket: list[int],
+        batch_size: int,
+        num_replicas: int = 1,
+        rank: int = 0,
+        drop_last: bool = False,
+        seed: int = 42,
+    ):
+        r"""
+        :param num_replicas (int, default 1): Set to `num_processes` or `ngpu`. Used to split
+            batches into different processes in DDP training.
+        """
         self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
         self.drop_last = drop_last
 
-        # Group global indices by their bucket string/ID
         self.bucket_indices = {}
         for idx, bucket_id in enumerate(item_to_bucket):
             if bucket_id not in self.bucket_indices:
                 self.bucket_indices[bucket_id] = []
             self.bucket_indices[bucket_id].append(idx)
 
+        self.batches = self._prepare_batches()
+        logger.info(f"BatchSampler: Prepared {len(self.batches)} batches.")
+
+    def _prepare_batches(self):
+        batches = []
+        for _, sids in self.bucket_indices.items():
+            random.seed(self.seed)
+            random.shuffle(sids)
+
+            for i in range(0, len(sids), self.batch_size):
+                batch = sids[i : i + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+
+        random.seed(self.seed)
+        random.shuffle(batches)
+
+        return batches[self.rank :: self.num_replicas]
+
     def __iter__(self):
-        all_batches = []
-        for bucket_id, indices in self.bucket_indices.items():
-            # Shuffle indices within the same bucket
-            shuffled_indices = torch.tensor(indices)[torch.randperm(len(indices))].tolist()
+        for batch in self.batches:
+            yield batch
 
-            for i in range(0, len(shuffled_indices), self.batch_size):
-                batch = shuffled_indices[i : i + self.batch_size]
-                if len(batch) == self.batch_size:
-                    all_batches.append(batch)
-                elif not self.drop_last:
-                    all_batches.append(batch)
-
-        # Global shuffle of batches to ensure the model sees different ratios throughout an epoch
-        batch_permutation = torch.randperm(len(all_batches)).tolist()
-        for idx in batch_permutation:
-            yield all_batches[idx]
-
-    def __len__(self):
-        count = 0
-        for indices in self.bucket_indices.values():
-            if self.drop_last:
-                count += len(indices) // self.batch_size
-            else:
-                count += (len(indices) + self.batch_size - 1) // self.batch_size
-        return count
+    def __len__(self) -> int:
+        return len(self.batches)
 
 
 def setup_logger(is_main_process: bool, rank: int, log_dir: str, log_filename: str, log_per_rank: bool):
@@ -259,7 +291,7 @@ def setup_logger(is_main_process: bool, rank: int, log_dir: str, log_filename: s
 
 def parse_args() -> tuple[argparse.Namespace, str]:
     parser = argparse.ArgumentParser("ControlNet of FLUX.2-Klein-9B Training")
-    timestamp = datetime.time().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     logger.info(f"Timestamp: {timestamp}")
 
     # ---------------- Folder --------------- #
@@ -283,6 +315,7 @@ def parse_args() -> tuple[argparse.Namespace, str]:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--bucket-data", action="store_true", default=False, help="Whether use bucket dataset.")
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--data-root", type=str, default=None)
 
     # ---------------- Train ---------------- #
     parser.add_argument("--seed", type=int, default=42, help="Choose a number you like, I like 42.")
@@ -316,15 +349,15 @@ def get_sigmas(
     device: torch.device,
     weight_dtype: torch.dtype,
 ) -> torch.Tensor:
-    sigmas: torch.Tensor = scheduler.sigmas.to(device=device, weight_dtype=weight_dtype)
-    all_timesteps: torch.Tensor = scheduler.timesteps.to(device=device, weight_dtype=weight_dtype)
+    sigmas: torch.Tensor = scheduler.sigmas.to(device=device, dtype=weight_dtype)
+    all_timesteps: torch.Tensor = scheduler.timesteps.to(device=device, dtype=weight_dtype)
 
-    timesteps = timesteps.to(device=device, weight_dtype=weight_dtype)
+    timesteps = timesteps.to(device=device, dtype=weight_dtype)
     indices = [(all_timesteps == t).nonzero().item() for t in timesteps]
 
     sigmas = sigmas[indices].flatten()
     while sigmas.ndim < ndim:
-        sigmas.unsqueeze(-1)
+        sigmas = sigmas.unsqueeze(-1)
     return sigmas
 
 
@@ -366,7 +399,7 @@ def log_validation(
     if not is_final_validation or final_checkpoint is None:
         controlnet = accelerator.unwrap_model(controlnet)
         pipeline = Flux2KleinControlNetPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            pretrained_model_name_or_path=args.base_model,
             controlnet=controlnet,
             transformer=transformer,
             torch_dtype=weight_dtype,
@@ -378,7 +411,7 @@ def log_validation(
             device_map=device,
         )
         pipeline = Flux2KleinControlNetPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            pretrained_model_name_or_path=args.base_model,
             controlnet=controlnet,
             transformer=transformer,
             torch_dtype=weight_dtype,
@@ -463,7 +496,7 @@ def train(args: argparse.Namespace, timestamp: str):
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        log_with=args.low_with,
+        log_with=args.log_with,
         project_config=ProjectConfiguration(project_dir=output_dir, logging_dir=log_dir),
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
@@ -489,6 +522,7 @@ def train(args: argparse.Namespace, timestamp: str):
         data_file=args.data_file,
         base_resolution=args.base_resolution,
         bucket_data=args.bucket_data,
+        data_root=args.data_root,
     )
     evalset = copy.deepcopy(trainset)
     train_loader = DataLoader(
@@ -496,9 +530,19 @@ def train(args: argparse.Namespace, timestamp: str):
         batch_sampler=BucketBatchSampler(
             trainset.item_to_bucket,
             batch_size=args.batch_size,
+            rank=RANK,
+            num_replicas=WORLD_SIZE,
+            seed=args.seed,
         ),
-        num_workers=8,
+        num_workers=args.num_workers,
     )
+    # train_loader = DataLoader(
+    #     trainset,
+    #     batch_size=args.batch_size,
+    #     shuffle=True,
+    #     num_workers=args.num_workers,
+    #     drop_last=False,
+    # )
 
     # ---------------- Pipeline ---------------- #
     tokenizer = None
@@ -520,7 +564,7 @@ def train(args: argparse.Namespace, timestamp: str):
         text_encoder.requires_grad_(False)
         logger.info(f"Load text_encoder to {WEIGHT_DTYPE} on {DEVICE}")
     vae = AutoencoderKLFlux2.from_pretrained(
-        args.pretrained_model_name_or_path,
+        pretrained_model_name_or_path=args.base_model,
         subfolder="vae",
         torch_dtype=WEIGHT_DTYPE,
         device_map=DEVICE,
@@ -598,7 +642,7 @@ def train(args: argparse.Namespace, timestamp: str):
     log_content += f"\n  Num update steps per epoch: {update_steps_per_epoch}"
     log_content += f"\n  Num update steps: {args.max_training_steps}"
     log_content += f"\n  Gradient accumulation steps: {accelerator.gradient_accumulation_steps}"
-    log_content += "=" * len(log_title)
+    log_content += "\n" + "=" * len(log_title)
     logger.info(log_content)
 
     global_steps = 0
@@ -627,8 +671,8 @@ def train(args: argparse.Namespace, timestamp: str):
                 # TODO: Add CFG if required
                 # ...
 
-                source_images = pipeline.prepare_images(source_images, pipeline.image_processor)
-                control_images = pipeline.prepare_images(control_images, pipeline.mask_processor)
+                # source_images = pipeline.prepare_images(source_images, pipeline.image_processor)
+                # control_images = pipeline.prepare_images(control_images, pipeline.mask_processor)
 
                 B, _, H, W = target_images.shape
 
@@ -641,21 +685,23 @@ def train(args: argparse.Namespace, timestamp: str):
                     device=DEVICE,
                     generator=GENERATOR,
                 )
-                source_target_latents, source_target_ids = pipeline.prepare_image_latents(
-                    images=torch.cat([source_images, target_images], dim=0),
-                    batch_size=B * 2,
+                source_latents, source_ids = pipeline.prepare_image_latents(
+                    images=[source_images],
+                    batch_size=B,
                     generator=GENERATOR,
                     device=DEVICE,
                     dtype=WEIGHT_DTYPE,
                 )
-                source_latents = source_target_latents[:B]
-                source_ids = source_target_ids[:B]
-                target_latents = source_target_latents[B:]
-                target_ids = source_target_ids[B:]
-
+                target_latents, target_ids = pipeline.prepare_image_latents(
+                    images=[target_images],
+                    batch_size=B,
+                    generator=GENERATOR,
+                    device=DEVICE,
+                    dtype=WEIGHT_DTYPE,
+                )
                 control_latents, control_latent_ids = pipeline.prepare_control_latents(
-                    cond_images=source_images,
-                    mask_images=control_images,
+                    cond_images=[source_images],
+                    mask_images=[control_images],
                     batch_size=B,
                     generator=GENERATOR,
                     device=DEVICE,
@@ -668,11 +714,19 @@ def train(args: argparse.Namespace, timestamp: str):
                     logit_mean=args.logit_mean,
                     logit_std=args.logit_std,
                     mode_scale=args.mode_scale,
+                    device=DEVICE,
                     generator=GENERATOR,
                 )
-                indices = (u * train_scheduler.config.num_train_timesteps).long()
-                timesteps = train_scheduler.timesteps[indices].to(DEVICE)
-                sigmas = get_sigmas(train_scheduler, timesteps, target_latents.ndim, DEVICE, WEIGHT_DTYPE)
+                indices = (u * train_scheduler.config.num_train_timesteps).long().cpu()
+                timesteps = train_scheduler.timesteps.cpu()
+                timesteps = timesteps[indices].to(DEVICE)
+                sigmas = get_sigmas(
+                    train_scheduler,
+                    timesteps,
+                    target_latents.ndim,
+                    device=DEVICE,
+                    weight_dtype=WEIGHT_DTYPE,
+                )
 
                 noisy_latents = (1.0 - sigmas) * target_latents + sigmas * noise_latents
                 pred_targets = noise_latents - target_latents
@@ -680,31 +734,32 @@ def train(args: argparse.Namespace, timestamp: str):
                 hidden_states = torch.cat([noisy_latents, source_latents], dim=1)
                 latent_image_ids = torch.cat([target_ids, source_ids], dim=1)
 
-                # ControlNet
-                controlnet_block_samples, controlnet_single_block_samples = controlnet(
-                    hidden_states=hidden_states,
-                    controlnet_cond=control_latents,
-                    timestep=timesteps / 1000,
-                    conditioning_scale=args.conditioning_scale,
-                    encoder_hidden_states=prompt_embeds,
-                    img_ids=latent_image_ids,
-                    txt_ids=text_ids,
-                    guidance=None,
-                    return_dict=False,
-                )
+                with accelerator.autocast():
+                    # ControlNet
+                    controlnet_block_samples, controlnet_single_block_samples = controlnet(
+                        hidden_states=hidden_states,
+                        controlnet_cond=control_latents,
+                        timestep=timesteps / 1000,
+                        conditioning_scale=args.conditioning_scale,
+                        encoder_hidden_states=prompt_embeds,
+                        img_ids=latent_image_ids,
+                        txt_ids=text_ids,
+                        guidance=None,
+                        return_dict=False,
+                    )
 
-                # Transformer, one step denoise
-                pred_vs = transformer(
-                    hidden_states=hidden_states,
-                    timestep=timesteps / 1000,
-                    encoder_hidden_states=prompt_embeds,
-                    img_ids=latent_image_ids,
-                    txt_ids=text_ids,
-                    guidance=None,
-                    controlnet_block_samples=controlnet_block_samples,
-                    controlnet_single_block_samples=controlnet_single_block_samples,
-                    return_dict=False,
-                )[0]
+                    # Transformer, one step denoise
+                    pred_vs = transformer(
+                        hidden_states=hidden_states,
+                        timestep=timesteps / 1000,
+                        encoder_hidden_states=prompt_embeds,
+                        img_ids=latent_image_ids,
+                        txt_ids=text_ids,
+                        guidance=None,
+                        controlnet_block_samples=controlnet_block_samples,
+                        controlnet_single_block_samples=controlnet_single_block_samples,
+                        return_dict=False,
+                    )[0]
                 pred_vs = pred_vs[:, : noisy_latents.shape[1], ...]
 
                 loss_weights = compute_loss_weighting_for_sd3(

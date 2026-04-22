@@ -53,7 +53,7 @@ class FLUX2KleinControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         rope_theta: int = 2000,
         eps: float = 1e-6,
         guidance_embeds: bool = True,
-        extra_condition_channles: int = 1,
+        extra_condition_channles: int = 3,
     ):
         r"""
         :param extra_condition_channels (int): We input mask with shape (1, H, W), the mask will
