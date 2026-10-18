@@ -12,7 +12,7 @@ from flux2.transformer_flux2klein import Flux2Transformer2DModel
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Flux2KleinControlNetPipeline ArgumentParser")
     parser.add_argument("--model", type=str, default="black-forest-labs/FLUX.2-Klein-9B")
-    parser.add_argument("--controlnet", type=str)
+    parser.add_argument("--controlnet", type=str, required=True)
     parser.add_argument("--conditioning-scale", type=float, default=1.0)
 
     return parser.parse_args()
@@ -28,7 +28,7 @@ if __name__ == "__main__":
         subfolder="transformer",
         torch_dtype=weight_dtype,
     ).to(device)
-    controlnet = FLUX2KleinControlNetModel.from_transformer(transformer)
+    controlnet = FLUX2KleinControlNetModel.from_pretrained(args.controlnet, torch_dtype=weight_dtype)
     controlnet.to(device=device, dtype=weight_dtype)
 
     pipeline = Flux2KleinControlNetPipeline.from_pretrained(

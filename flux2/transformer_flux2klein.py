@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 
@@ -259,8 +258,8 @@ class Flux2Transformer2DModel(
 
             # ControlNet
             if controlnet_block_samples is not None:
-                interval_control = math.ceil(len(self.transformer_blocks) / len(controlnet_block_samples))
-                hidden_states = hidden_states + controlnet_block_samples[index_block // interval_control]
+                head_index = index_block * len(controlnet_block_samples) // len(self.transformer_blocks)
+                hidden_states = hidden_states + controlnet_block_samples[head_index]
 
         # Concatenate text and image streams for single-block inference
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -287,10 +286,10 @@ class Flux2Transformer2DModel(
 
             # Control
             if controlnet_single_block_samples is not None:
-                interval_control = math.ceil(len(self.single_transformer_blocks) / len(controlnet_single_block_samples))
+                head_index = index_block * len(controlnet_single_block_samples) // len(self.single_transformer_blocks)
                 hidden_states[:, num_txt_tokens:, ...] = (
                     hidden_states[:, num_txt_tokens:, ...]
-                    + controlnet_single_block_samples[index_block // interval_control]
+                    + controlnet_single_block_samples[head_index]
                 )
 
         # Remove text tokens from concatenated stream

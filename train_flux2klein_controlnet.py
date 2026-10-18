@@ -14,7 +14,6 @@ from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
 from datetime import datetime
 from loguru import logger
 from PIL import Image
-from safetensors.torch import load_file, save_file
 
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torchvision.utils import save_image
@@ -172,7 +171,7 @@ class ControlNetImageEditDataset(Dataset):
             os.path.join(self.data_root, item["target_images"]) if self.data_root is not None else item["target_images"]
         )
         source_img = Image.open(source_path).convert("RGB")
-        control_img = Image.open(control_path).convert("RGB")
+        control_img = Image.open(control_path).convert("L")
         target_img = Image.open(target_path).convert("RGB")
 
         if "target_size" in item:
@@ -188,9 +187,9 @@ class ControlNetImageEditDataset(Dataset):
         source_img = self._crop_to_aspect_and_resize(source_img, (tw, th))
         control_img = self._crop_to_aspect_and_resize(control_img, (tw, th))
 
-        source_img = self.base_transform(source_img)
-        control_img = self.base_transform(control_img)
-        target_img = self.base_transform(target_img)
+        source_img = self.base_transform(source_img) * 2 - 1
+        control_img = (self.base_transform(control_img) >= 0.5).float().repeat(3, 1, 1)
+        target_img = self.base_transform(target_img) * 2 - 1
 
         # Optional: Convert to Tensors here if not using a separate transform
         return {
@@ -344,18 +343,18 @@ def unwrap_model(accelerator: Accelerator, model: torch.nn.Module):
 
 def get_sigmas(
     scheduler: FlowMatchEulerDiscreteScheduler,
-    timesteps: torch.Tensor,
+    indices: torch.Tensor,
     ndim: int,
     device: torch.device,
     weight_dtype: torch.dtype,
 ) -> torch.Tensor:
-    sigmas: torch.Tensor = scheduler.sigmas.to(device=device, dtype=weight_dtype)
-    all_timesteps: torch.Tensor = scheduler.timesteps.to(device=device, dtype=weight_dtype)
-
-    timesteps = timesteps.to(device=device, dtype=weight_dtype)
-    indices = [(all_timesteps == t).nonzero().item() for t in timesteps]
-
-    sigmas = sigmas[indices].flatten()
+    if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Scheduler indices must be a one-dimensional integer tensor")
+    if len(scheduler.sigmas) < len(scheduler.timesteps):
+        raise ValueError("Scheduler has fewer sigmas than timesteps")
+    if torch.any(indices < 0) or torch.any(indices >= len(scheduler.timesteps)):
+        raise IndexError("Scheduler index outside the timestep schedule")
+    sigmas = scheduler.sigmas[indices.to(scheduler.sigmas.device)].to(device=device, dtype=weight_dtype)
     while sigmas.ndim < ndim:
         sigmas = sigmas.unsqueeze(-1)
     return sigmas
@@ -406,7 +405,7 @@ def log_validation(
         )
     else:
         controlnet = FLUX2KleinControlNetModel.from_pretrained(
-            args.output_dir,
+            final_checkpoint,
             torch_dtype=weight_dtype,
             device_map=device,
         )
@@ -434,9 +433,9 @@ def log_validation(
         target_image = sample.get("target_images", None)
         prompt = sample.get("prompts", None)
 
-        source_image = T.ToPILImage()(source_image)
+        source_image = T.ToPILImage()((source_image + 1) / 2)
         control_image = T.ToPILImage()(control_image)
-        target_image = T.ToPILImage()(target_image)
+        target_image = T.ToPILImage()((target_image + 1) / 2)
 
         with autocast_ctx:
             image = pipeline(
@@ -692,7 +691,7 @@ def train(args: argparse.Namespace, timestamp: str):
                     device=DEVICE,
                     dtype=WEIGHT_DTYPE,
                 )
-                target_latents, target_ids = pipeline.prepare_image_latents(
+                target_latents, _ = pipeline.prepare_image_latents(
                     images=[target_images],
                     batch_size=B,
                     generator=GENERATOR,
@@ -718,21 +717,20 @@ def train(args: argparse.Namespace, timestamp: str):
                     generator=GENERATOR,
                 )
                 indices = (u * train_scheduler.config.num_train_timesteps).long().cpu()
-                timesteps = train_scheduler.timesteps.cpu()
-                timesteps = timesteps[indices].to(DEVICE)
                 sigmas = get_sigmas(
                     train_scheduler,
-                    timesteps,
+                    indices,
                     target_latents.ndim,
                     device=DEVICE,
                     weight_dtype=WEIGHT_DTYPE,
                 )
+                timesteps = train_scheduler.timesteps.cpu()[indices].to(DEVICE)
 
                 noisy_latents = (1.0 - sigmas) * target_latents + sigmas * noise_latents
                 pred_targets = noise_latents - target_latents
 
                 hidden_states = torch.cat([noisy_latents, source_latents], dim=1)
-                latent_image_ids = torch.cat([target_ids, source_ids], dim=1)
+                latent_image_ids = torch.cat([noise_ids, source_ids], dim=1)
 
                 with accelerator.autocast():
                     # ControlNet
@@ -787,11 +785,10 @@ def train(args: argparse.Namespace, timestamp: str):
                 if IS_MAIN_PROCESS and global_steps % args.save_steps == 0:
                     save_path = os.path.join(
                         checkpoint_dir,
-                        f"checkpoint-{global_steps:0{align_bit}d}.safetensors",
+                        f"checkpoint-{global_steps:0{align_bit}d}",
                     )
-                    unwrap_controlnet = unwrap_model(accelerator, controlnet).to(torch.float32)
-                    state_dicts = unwrap_controlnet.state_dict()
-                    save_file(state_dicts, save_path)
+                    unwrap_controlnet = unwrap_model(accelerator, controlnet)
+                    unwrap_controlnet.save_pretrained(save_path)
                     logger.info(f"Save state to {save_path}")
 
                 if IS_MAIN_PROCESS and global_steps % args.eval_steps == 0:
@@ -823,7 +820,7 @@ def train(args: argparse.Namespace, timestamp: str):
     if IS_MAIN_PROCESS:
         save_path = os.path.join(checkpoint_dir, "lastest")
         os.makedirs(save_path, exist_ok=True)
-        unwrap_controlnet: FLUX2KleinControlNetModel = unwrap_model(accelerator, controlnet).to(torch.float32)
+        unwrap_controlnet: FLUX2KleinControlNetModel = unwrap_model(accelerator, controlnet)
         unwrap_controlnet.save_pretrained(save_path)
 
         random_indices = random.choices(list(range(len(evalset))), k=args.num_eval)

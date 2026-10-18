@@ -548,8 +548,12 @@ class Flux2KleinControlNetPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 1 for visible, -1 for mask out
-        masked_images = [torch.where(m > 0, c, 2 * m - 1) for m, c in zip(mask_images, cond_images)]
+        mask_images = [(m >= 0.5).to(dtype=m.dtype) for m in mask_images]
+        mask_images = [m.repeat(1, 3, 1, 1) if m.shape[1] == 1 else m for m in mask_images]
+        if any(m.shape[1] != 3 for m in mask_images):
+            raise ValueError("Control masks must have one or three channels")
+        # Mask 1 preserves the source; mask 0 replaces it with normalized black.
+        masked_images = [torch.where(m > 0, c, -1.0) for m, c in zip(mask_images, cond_images)]
 
         # List length B, (1, 32*4, H', W') each elem
         control_images = []
@@ -558,7 +562,7 @@ class Flux2KleinControlNetPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             masked_image_latent = self._encode_vae_image(image=masked_image, generator=generator)
             control_images.append(masked_image_latent)
 
-        # Reshape mask directly, list length B, (1, 1, H', W') each elem
+        # Reshape mask directly, list length B, (1, 3, H', W') each elem
         mask_images = [
             torch.nn.functional.interpolate(m, size=[c.shape[-2], c.shape[-1]]).to(device, dtype)
             for m, c in zip(mask_images, control_images)
